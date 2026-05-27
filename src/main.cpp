@@ -62,13 +62,26 @@ std::string compile(const std::string& tmpl) {
     auto end = std::sregex_iterator();
     size_t pos = 0;
 
+
+
     for (; it != end; ++it) {
         auto& m = *it;
+
         // everything before the match
         result += tmpl.substr(pos, m.position() - pos);
-        // execute and escape
+
         std::string cmd = m[1].str();
-        result += escapeJSON(execBash(cmd));
+        std::string out = execBash(cmd);
+
+        // peek at char immediately before <#! in the accumulated result
+        bool isString = !result.empty() && result.back() == '"';
+
+        if (isString) {
+            result += escapeJSON(out);
+        } else {
+            result += out;
+        }
+
         pos = m.position() + m.length();
     }
     // remainder
