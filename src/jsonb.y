@@ -120,7 +120,7 @@ void context_free(Context *ctx) {
 
 /* ---------- Shell command execution ---------- */
 char *exec_shell(const char *cmd) {
-    char buf[4096];
+    char buf[1024000]; 
     char *result = strdup("");
     FILE *pipe = popen(cmd, "r");
     if (!pipe) return strdup("null");
