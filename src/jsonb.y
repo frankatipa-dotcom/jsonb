@@ -245,35 +245,56 @@ char *eval_node(ASTNode *n, Context *ctx) {
             else if (strcmp(cond_str, "false") == 0) cond = 0;
             else {
                 char *val = context_get(ctx, cond_str);
-                if (val && strcmp(val, "true") == 0) cond = 1;
-                free(val);
+                if (val) {
+                    if (strcmp(val, "true") == 0) cond = 1;
+                    free(val);
+                }
             }
-            if (cond)
-                return eval_object_body(n->child, ctx);
+            ASTNode *branch = cond ? n->child : n->else_body;
+            // Detect array vs object context by checking if items have keys
+            if (branch && branch->key)
+                return eval_object_body(branch, ctx);
             else
-                return eval_object_body(n->else_body, ctx);
+                return eval_array_body(branch, ctx);
         }
         case AST_FOR: {
             char *arr_str = context_get(ctx, n->string_val);
             if (!arr_str) return strdup("");
-            struct PairCollector {
-                Context *ctx;
-                char *loop_var;
-                ASTNode *body;
-                char *result;
-            } pc = {ctx, n->loop_var, n->child, strdup("")};
-            void add_elem(const char *elem, void *user) {
-                struct PairCollector *pc = user;
-                context_set(pc->ctx, pc->loop_var, elem);
-                char *body_res = eval_object_body(pc->body, pc->ctx);
-                char *old = pc->result;
-                pc->result = concat(pc->result, body_res);
-                free(old);
-                free(body_res);
+            char *result = strdup("");
+            const char *p = arr_str;
+            if (*p == '[') p++;
+            while (*p && *p != ']') {
+                while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+                char *elem = NULL;
+                if (*p == '"') {
+                    p++;
+                    const char *start = p;
+                    while (*p && *p != '"') p++;
+                    elem = strndup(start, p - start);
+                    if (*p == '"') p++;
+                } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
+                    const char *start = p;
+                    while (*p && ((*p >= '0' && *p <= '9') || *p == '.' || *p == '-' || *p == 'e' || *p == 'E')) p++;
+                    elem = strndup(start, p - start);
+                } else if (*p != ']') {
+                    while (*p && *p != ',' && *p != ']') p++;
+                }
+                if (elem) {
+                    context_set(ctx, n->loop_var, elem);
+                    free(elem);
+                    char *body_res = (n->child && n->child->key)
+                        ? eval_object_body(n->child, ctx)
+                        : eval_array_body(n->child, ctx);
+                    char *old = result;
+                    result = concat(result, body_res);
+                    free(old);
+                    free(body_res);
+                }
+                while (*p == ' ' || *p == '\t' || *p == '\n') p++;
+                if (*p == ',') p++;
             }
-            json_array_foreach(arr_str, add_elem, &pc);
             free(arr_str);
-            return pc.result;
+            return result;
         }
         default: return strdup("");
     }
@@ -298,10 +319,11 @@ char *eval_object_body(ASTNode *items, Context *ctx) {
             char *pair2 = concat(pair, val_json);
             free(key_json); free(val_json); free(pair);
             char *old = res;
-            if (res[0]) res = concat(res, ",");
-            else res = concat(res, "");
-            free(old);
-            old = res;
+            if (res[0]) {
+                res = concat(res, ",");
+                free(old);
+                old = res;
+            }
             res = concat(res, pair2);
             free(old);
             free(pair2);
@@ -317,10 +339,11 @@ char *eval_array_body(ASTNode *items, Context *ctx) {
     while (item) {
         char *val = eval_node(item, ctx);
         char *old = res;
-        if (res[0]) res = concat(res, ",");
-        else res = concat(res, "");
-        free(old);
-        old = res;
+        if (res[0]) {
+            res = concat(res, ",");
+            free(old);
+            old = res;
+        }
         res = concat(res, val);
         free(old);
         free(val);
@@ -501,10 +524,24 @@ array_item:
     /* Standard Element */
     value { $$ = $1; }
     
-    /* Control Flow Blocks for Arrays - set to NULL until we map Block AST nodes */
-    | BLOCK_START IF block_expr BLOCK_END array_items BLOCK_START ENDIF BLOCK_END { $$ = NULL; }
-    | BLOCK_START IF block_expr BLOCK_END array_items BLOCK_START ELSE BLOCK_END array_items BLOCK_START ENDIF BLOCK_END { $$ = NULL; }
-    | BLOCK_START FOR IDENTIFIER IN IDENTIFIER BLOCK_END array_items BLOCK_START ENDFOR BLOCK_END { $$ = NULL; }
+    /* Control Flow Blocks for Arrays */
+    | BLOCK_START IF block_expr BLOCK_END array_items BLOCK_START ENDIF BLOCK_END {
+        $$ = make_node(AST_IF);
+        $$->string_val = $3;
+        $$->child = $5;
+    }
+    | BLOCK_START IF block_expr BLOCK_END array_items BLOCK_START ELSE BLOCK_END array_items BLOCK_START ENDIF BLOCK_END {
+        $$ = make_node(AST_IF);
+        $$->string_val = $3;
+        $$->child = $5;
+        $$->else_body = $9;
+    }
+    | BLOCK_START FOR IDENTIFIER IN IDENTIFIER BLOCK_END array_items BLOCK_START ENDFOR BLOCK_END {
+        $$ = make_node(AST_FOR);
+        $$->loop_var = strdup($3);
+        $$->string_val = strdup($5);
+        $$->child = $7;
+    }
     ;
 
 /* ------ Block Expressions ------ */

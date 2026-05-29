@@ -65,7 +65,6 @@ void yyerror(const char *s);
 }
 
 <IN_RAW_EXPR>{
-    "}}?"                   { /* do nothing */ }
     "}}}"                   { yy_pop_state(); return RAW_EXPR_END; }
     [^}]+                   { yylval.str = strdup(yytext); return SHELL_CONTENT; }
     "}"                     { yylval.str = strdup(yytext); return SHELL_CONTENT; }
