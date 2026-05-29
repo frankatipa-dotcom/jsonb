@@ -120,7 +120,7 @@ void context_free(Context *ctx) {
 
 /* ---------- Shell command execution ---------- */
 char *exec_shell(const char *cmd) {
-    char buf[256];
+    char buf[4096];
     char *result = strdup("");
     FILE *pipe = popen(cmd, "r");
     if (!pipe) return strdup("null");
@@ -130,7 +130,7 @@ char *exec_shell(const char *cmd) {
         free(old);
     }
     pclose(pipe);
-    // trim trailing newline
+    /* trim single trailing newline — interior newlines are preserved for json_escape */
     size_t len = strlen(result);
     if (len > 0 && result[len-1] == '\n') result[len-1] = '\0';
     return result;
@@ -272,13 +272,20 @@ char *eval_node(ASTNode *n, Context *ctx) {
         case AST_RAW_TEXT: return strdup(n->string_val ? n->string_val : "");
         case AST_SHELL_CMD: {
             char *out = exec_shell(n->string_val);
-            // try to parse as JSON, otherwise quote as string
-            if (out[0] == '{' || out[0] == '[' || out[0] == '"' || 
-                (out[0] >= '0' && out[0] <= '9') || !strcmp(out,"true") || !strcmp(out,"false") || !strcmp(out,"null"))
+            /* If output looks like a self-contained JSON value, emit it raw.
+               Otherwise escape it and wrap in quotes. */
+            if (out[0] != '\0' && (
+                out[0] == '{' || out[0] == '[' || out[0] == '"' ||
+                (out[0] >= '0' && out[0] <= '9') || out[0] == '-' ||
+                !strcmp(out,"true") || !strcmp(out,"false") || !strcmp(out,"null")))
+            {
                 return out;
-            char *quoted = malloc(strlen(out) + 3);
-            sprintf(quoted, "\"%s\"", out);
+            }
+            char *escaped = json_escape(out);
             free(out);
+            char *quoted = malloc(strlen(escaped) + 3);
+            sprintf(quoted, "\"%s\"", escaped);
+            free(escaped);
             return quoted;
         }
         case AST_OBJECT: {
@@ -684,39 +691,6 @@ block_expr:
 
 void yyerror(const char *s) {
     fprintf(stderr, "Parse Error at line %d: %s\n", yylineno, s);
-}
-
-
-// Executes a shell command and returns the output as a newly allocated string.
-char* evaluate_shell_command(const char* cmd) {
-    char buffer[256];
-    size_t result_size = 1;
-    char* result = malloc(result_size);
-    result[0] = '\0';
-
-    // Open a pipe to the shell command
-    FILE *pipe = popen(cmd, "r");
-    if (!pipe) {
-        fprintf(stderr, "Failed to run command: %s\n", cmd);
-        return strdup("null");
-    }
-
-    // Read the output block by block
-    while (fgets(buffer, sizeof(buffer), pipe) != NULL) {
-        size_t len = strlen(buffer);
-        result = realloc(result, result_size + len);
-        strcat(result, buffer);
-        result_size += len;
-    }
-
-    pclose(pipe);
-
-    // Strip the trailing newline that echo/date usually adds
-    if (result_size > 1 && result[result_size - 2] == '\n') {
-        result[result_size - 2] = '\0';
-    }
-
-    return result;
 }
 
 
