@@ -17,9 +17,10 @@ typedef enum {
     AST_OBJECT, 
     AST_ARRAY, 
     AST_SHELL_CMD,
-    AST_IF,            // if block
-    AST_FOR,           // for loop
-    AST_BLOCK_LIST     // sequence of statements/nodes inside a block
+    AST_RAW_TEXT,       // literal text emitted verbatim (e.g. "," from {% else %},{% endif %})
+    AST_IF,             // if block
+    AST_FOR,            // for loop
+    AST_BLOCK_LIST      // sequence of statements/nodes inside a block
 } NodeType;
 
 
@@ -33,6 +34,7 @@ typedef struct ASTNode {
     struct ASTNode* condition;   // expression that yields boolean (for IF)
     struct ASTNode* else_body;   // for IF-ELSE
     char* loop_var;               // variable name (FOR)
+    char* loop_array_literal;     // inline array literal for FOR (if not from context)
     struct ASTNode* iterable;     // expression that yields an array (FOR)
 } ASTNode;
 
@@ -51,6 +53,7 @@ ASTNode* make_node(NodeType type) {
     node->condition = NULL;
     node->else_body = NULL;
     node->loop_var = NULL;
+    node->loop_array_literal = NULL;
     node->iterable = NULL;
     return node;
 }
@@ -133,22 +136,74 @@ char *exec_shell(const char *cmd) {
     return result;
 }
 
+/* ---------- JSON string escaping ---------- */
+/* Returns a newly-allocated string safe for embedding inside JSON "..." */
+char *json_escape(const char *s) {
+    if (!s) return strdup("");
+    size_t len = 0;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"' || c == '\\') len += 2;
+        else if (c < 0x20) len += 6; /* \uXXXX */
+        else len += 1;
+    }
+    char *out = malloc(len + 1);
+    char *q = out;
+    for (const char *p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"')       { *q++ = '\\'; *q++ = '"'; }
+        else if (c == '\\') { *q++ = '\\'; *q++ = '\\'; }
+        else if (c == '\n') { *q++ = '\\'; *q++ = 'n'; }
+        else if (c == '\r') { *q++ = '\\'; *q++ = 'r'; }
+        else if (c == '\t') { *q++ = '\\'; *q++ = 't'; }
+        else if (c == '\b') { *q++ = '\\'; *q++ = 'b'; }
+        else if (c == '\f') { *q++ = '\\'; *q++ = 'f'; }
+        else if (c < 0x20)  { q += sprintf(q, "\\u%04x", c); }
+        else *q++ = c;
+    }
+    *q = '\0';
+    return out;
+}
+
 /* ---------- String interpolation ---------- */
 char *interpolate_string(const char *s, Context *ctx) {
     char *res = strdup("");
     const char *p = s;
     while (*p) {
         if (p[0] == '{' && p[1] == '{') {
+            /* {{ cmd }} — shell output, JSON-escaped */
             const char *end = strstr(p+2, "}}");
             if (!end) break;
             char *cmd = strndup(p+2, end - (p+2));
-            char *out = exec_shell(cmd);
+            /* trim leading/trailing whitespace from cmd */
+            while (*cmd == ' ' || *cmd == '\t') cmd++;
+            char *cmd_end = cmd + strlen(cmd) - 1;
+            while (cmd_end > cmd && (*cmd_end == ' ' || *cmd_end == '\t')) *cmd_end-- = '\0';
+            /* Check if it's a context variable first, then fall back to shell */
+            char *raw = context_get(ctx, cmd);
+            if (!raw) raw = exec_shell(cmd);
+            char *escaped = json_escape(raw);
+            free(raw);
             char *old = res;
-            res = concat(res, out);
-            free(old);
-            free(out);
-            free(cmd);
+            res = concat(res, escaped);
+            free(old); free(escaped); free(cmd);
             p = end + 2;
+        } else if (p[0] == '$' && p[1] == '(') {
+            /* $(...) — shell substitution stored verbatim as marker */
+            const char *end = strchr(p+2, ')');
+            if (!end) { /* no closing paren, treat as literal */
+                char tmp[2] = { *p, 0 };
+                char *old = res; res = concat(res, tmp); free(old); p++;
+                continue;
+            }
+            char *cmd = strndup(p+2, end - (p+2));
+            char *raw = exec_shell(cmd);
+            char *escaped = json_escape(raw);
+            free(raw); free(cmd);
+            char *old = res;
+            res = concat(res, escaped);
+            free(old); free(escaped);
+            p = end + 1;
         } else {
             char *old = res;
             char tmp[2] = { *p, 0 };
@@ -213,6 +268,7 @@ char *eval_node(ASTNode *n, Context *ctx) {
         }
         case AST_BOOLEAN: return strdup(n->string_val);
         case AST_NULL: return strdup("null");
+        case AST_RAW_TEXT: return strdup(n->string_val ? n->string_val : "");
         case AST_SHELL_CMD: {
             char *out = exec_shell(n->string_val);
             // try to parse as JSON, otherwise quote as string
@@ -258,11 +314,36 @@ char *eval_node(ASTNode *n, Context *ctx) {
                 return eval_array_body(branch, ctx);
         }
         case AST_FOR: {
-            char *arr_str = context_get(ctx, n->string_val);
-            if (!arr_str) return strdup("");
+            /* Resolve the iterable: inline literal takes priority over context lookup */
+            const char *arr_str_raw = n->loop_array_literal
+                ? n->loop_array_literal
+                : context_get(ctx, n->string_val);
+            if (!arr_str_raw) return strdup("");
+            char *arr_str = (char *)arr_str_raw; /* may be borrowed or owned */
+
             char *result = strdup("");
             const char *p = arr_str;
             if (*p == '[') p++;
+
+            /* First pass: count elements so we know total for loop.last */
+            int total = 0;
+            const char *scan = p;
+            while (*scan && *scan != ']') {
+                while (*scan == ' ' || *scan == '\t' || *scan == '\n') scan++;
+                if (*scan == '"') {
+                    scan++; while (*scan && *scan != '"') scan++; if (*scan) scan++;
+                    total++;
+                } else if (*scan == '-' || (*scan >= '0' && *scan <= '9')) {
+                    while (*scan && ((*scan >= '0' && *scan <= '9') || *scan == '.' || *scan == '-' || *scan == 'e' || *scan == 'E')) scan++;
+                    total++;
+                } else if (*scan != ']') {
+                    while (*scan && *scan != ',' && *scan != ']') scan++;
+                }
+                while (*scan == ' ' || *scan == '\t' || *scan == '\n') scan++;
+                if (*scan == ',') scan++;
+            }
+
+            int idx = 0;
             while (*p && *p != ']') {
                 while (*p == ' ' || *p == '\t' || *p == '\n') p++;
                 char *elem = NULL;
@@ -281,6 +362,9 @@ char *eval_node(ASTNode *n, Context *ctx) {
                 }
                 if (elem) {
                     context_set(ctx, n->loop_var, elem);
+                    /* Set loop.first / loop.last helpers */
+                    context_set(ctx, "loop.first", idx == 0 ? "true" : "false");
+                    context_set(ctx, "loop.last",  idx == total - 1 ? "true" : "false");
                     free(elem);
                     char *body_res = (n->child && n->child->key)
                         ? eval_object_body(n->child, ctx)
@@ -289,11 +373,13 @@ char *eval_node(ASTNode *n, Context *ctx) {
                     result = concat(result, body_res);
                     free(old);
                     free(body_res);
+                    idx++;
                 }
                 while (*p == ' ' || *p == '\t' || *p == '\n') p++;
                 if (*p == ',') p++;
             }
-            free(arr_str);
+            /* Only free if we owned the string (context_get returns a copy) */
+            if (!n->loop_array_literal) free(arr_str);
             return result;
         }
         default: return strdup("");
@@ -336,16 +422,26 @@ char *eval_object_body(ASTNode *items, Context *ctx) {
 char *eval_array_body(ASTNode *items, Context *ctx) {
     char *res = strdup("");
     ASTNode *item = items;
+    int need_comma = 0; /* tracks whether to insert a separator before next value item */
     while (item) {
         char *val = eval_node(item, ctx);
-        char *old = res;
-        if (res[0]) {
-            res = concat(res, ",");
+        if (item->type == AST_RAW_TEXT || item->type == AST_IF || item->type == AST_FOR) {
+            /* Block results manage their own separators — emit verbatim, reset comma state */
+            char *old = res;
+            res = concat(res, val);
             free(old);
-            old = res;
+            need_comma = 0; /* caller is managing separators via raw text */
+        } else {
+            if (need_comma) {
+                char *old = res;
+                res = concat(res, ",");
+                free(old);
+            }
+            char *old = res;
+            res = concat(res, val);
+            free(old);
+            need_comma = 1;
         }
-        res = concat(res, val);
-        free(old);
         free(val);
         item = item->next;
     }
@@ -379,7 +475,7 @@ char *eval_array_body(ASTNode *items, Context *ctx) {
 %token BLOCK_START BLOCK_END
 %token IF ELSE ENDIF FOR IN ENDFOR INCLUDE MACRO
 
-%token <str> NUMBER STR_CHAR STRING_LITERAL SHELL_CONTENT IDENTIFIER
+%token <str> NUMBER STR_CHAR STRING_LITERAL SHELL_CONTENT IDENTIFIER SHELL_SUBST ARRAY_LITERAL
 
 %start document
 
@@ -414,13 +510,21 @@ json_string:
 
 string_content:
     /* empty */ { $$ = strdup(""); }
-    | string_content STR_CHAR { $$ = concat($1, $2); }
+    | string_content STR_CHAR { $$ = concat($1, $2); free($1); }
+    | string_content SHELL_SUBST {
+        /* Store as $(...) marker so interpolate_string can exec it at eval */
+        char *marker = malloc(strlen($2) + 4);
+        sprintf(marker, "$(%s)", $2);
+        $$ = concat($1, marker);
+        free($1); free(marker);
+    }
     | string_content EXPR_START EXPR_END { $$ = $1; }
     | string_content EXPR_START shell_content_list EXPR_END {
         // Rebuild the literal string so the evaluator can parse it later
         char* tmp1 = concat($1, "{{");
         char* tmp2 = concat(tmp1, $3);
         $$ = concat(tmp2, "}}");
+        free($1); free(tmp1); free(tmp2); free($3);
     }
     ;
 
@@ -471,6 +575,13 @@ object_item: json_string COLON value {
     $$ = make_node(AST_FOR);
     $$->loop_var = strdup($3);
     $$->string_val = strdup($5);
+    $$->child = $7;
+}
+| BLOCK_START FOR IDENTIFIER IN ARRAY_LITERAL BLOCK_END object_items BLOCK_START ENDFOR BLOCK_END {
+    $$ = make_node(AST_FOR);
+    $$->loop_var = strdup($3);
+    $$->loop_array_literal = strdup($5);
+    $$->string_val = strdup("");
     $$->child = $7;
 };
 
@@ -524,6 +635,12 @@ array_item:
     /* Standard Element */
     value { $$ = $1; }
     
+    /* Raw comma — used in {% if loop.first %}{% else %},{% endif %} pattern */
+    | COMMA {
+        $$ = make_node(AST_RAW_TEXT);
+        $$->string_val = strdup(",");
+    }
+
     /* Control Flow Blocks for Arrays */
     | BLOCK_START IF block_expr BLOCK_END array_items BLOCK_START ENDIF BLOCK_END {
         $$ = make_node(AST_IF);
@@ -540,6 +657,13 @@ array_item:
         $$ = make_node(AST_FOR);
         $$->loop_var = strdup($3);
         $$->string_val = strdup($5);
+        $$->child = $7;
+    }
+    | BLOCK_START FOR IDENTIFIER IN ARRAY_LITERAL BLOCK_END array_items BLOCK_START ENDFOR BLOCK_END {
+        $$ = make_node(AST_FOR);
+        $$->loop_var = strdup($3);
+        $$->loop_array_literal = strdup($5);
+        $$->string_val = strdup("");
         $$->child = $7;
     }
     ;

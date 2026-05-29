@@ -50,18 +50,28 @@ void yyerror(const char *s);
 <IN_STRING>{
     \"                      { yy_pop_state(); return DOUBLE_QUOTE; }
     
-    /* String interpolation */
+    /* String interpolation {{ }} */
     "{{"                    { yy_push_state(IN_EXPR); return EXPR_START; }
     
+    /* Shell substitution $(...) — strip delimiters, pass command text */
+    "$("[^)]*")"            { 
+                              /* yytext is e.g. "$(date +%s)" — extract inner cmd */
+                              int len = strlen(yytext);
+                              /* yytext+2 skips "$(" and len-3 skips the closing ")" */
+                              yylval.str = strndup(yytext + 2, len - 3);
+                              return SHELL_SUBST;
+                            }
+
     /* Escaped characters */
     \\["\\/bfnrt]           { yylval.str = strdup(yytext); return STR_CHAR; }
     \\u[0-9a-fA-F]{4}       { yylval.str = strdup(yytext); return STR_CHAR; }
     
-    /* Normal string contents (allow literal newlines based on multiline test case) */
-    [^\"{\\]+               { yylval.str = strdup(yytext); return STR_CHAR; }
+    /* Normal string contents — exclude " { \ $ */
+    [^\"{\\$]+              { yylval.str = strdup(yytext); return STR_CHAR; }
     
-    /* Catch standalone braces not part of {{ */
+    /* Catch standalone braces/dollars not part of {{ or $( */
     "{"                     { yylval.str = strdup(yytext); return STR_CHAR; }
+    "$"                     { yylval.str = strdup(yytext); return STR_CHAR; }
 }
 
 <IN_RAW_EXPR>{
@@ -90,13 +100,17 @@ void yyerror(const char *s);
     
     "true"                  { return TRUE_TOK; }
     "false"                 { return FALSE_TOK; }
+
+    /* loop.first / loop.last / dotted identifiers */
+    [a-zA-Z_][a-zA-Z0-9_]*("."[a-zA-Z_][a-zA-Z0-9_]*)* { yylval.str = strdup(yytext); return IDENTIFIER; }
     
     /* Single or double quoted strings inside blocks */
     \"([^\"\\]|\\.)*\" |
     '([^'\\]|\\.)*'         { yylval.str = strdup(yytext); return STRING_LITERAL; }
     
-    [a-zA-Z_][a-zA-Z0-9_]* { yylval.str = strdup(yytext); return IDENTIFIER; }
-    
+    /* Inline JSON array literal inside block (e.g. for x in [...]) */
+    "["[^]]*"]"             { yylval.str = strdup(yytext); return ARRAY_LITERAL; }
+
     [ \t\n\r]+              { /* Skip whitespace */ }
     .                       { return yytext[0]; }
 }
