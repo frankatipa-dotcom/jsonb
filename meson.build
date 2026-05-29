@@ -26,6 +26,6 @@ flex_gen = custom_target(
 # 3. Build the Executable
 executable(
   'jsonb',
-  sources : [flex_gen, bison_gen]
+  sources : [flex_gen, bison_gen],
   install : true
 )
