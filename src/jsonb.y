@@ -174,8 +174,9 @@ char *interpolate_string(const char *s, Context *ctx) {
             /* {{ cmd }} — shell output, JSON-escaped */
             const char *end = strstr(p+2, "}}");
             if (!end) break;
-            char *cmd = strndup(p+2, end - (p+2));
-            /* trim leading/trailing whitespace from cmd */
+            char *cmd_base = strndup(p+2, end - (p+2));
+            /* trim leading/trailing whitespace — work on a pointer, not the base */
+            char *cmd = cmd_base;
             while (*cmd == ' ' || *cmd == '\t') cmd++;
             char *cmd_end = cmd + strlen(cmd) - 1;
             while (cmd_end > cmd && (*cmd_end == ' ' || *cmd_end == '\t')) *cmd_end-- = '\0';
@@ -186,12 +187,12 @@ char *interpolate_string(const char *s, Context *ctx) {
             free(raw);
             char *old = res;
             res = concat(res, escaped);
-            free(old); free(escaped); free(cmd);
+            free(old); free(escaped); free(cmd_base); /* free base, not trimmed ptr */
             p = end + 2;
         } else if (p[0] == '$' && p[1] == '(') {
-            /* $(...) — shell substitution stored verbatim as marker */
+            /* $(...) — shell substitution */
             const char *end = strchr(p+2, ')');
-            if (!end) { /* no closing paren, treat as literal */
+            if (!end) {
                 char tmp[2] = { *p, 0 };
                 char *old = res; res = concat(res, tmp); free(old); p++;
                 continue;
@@ -205,8 +206,8 @@ char *interpolate_string(const char *s, Context *ctx) {
             free(old); free(escaped);
             p = end + 1;
         } else {
-            char *old = res;
             char tmp[2] = { *p, 0 };
+            char *old = res;
             res = concat(res, tmp);
             free(old);
             p++;
@@ -491,13 +492,13 @@ document:
 
 value:
     json_string    { $$ = $1; }
-    | NUMBER       { $$ = make_node(AST_NUMBER); $$->string_val = strdup($1); }
+    | NUMBER       { $$ = make_node(AST_NUMBER); $$->string_val = $1; }
     | TRUE_TOK     { $$ = make_node(AST_BOOLEAN); $$->string_val = strdup("true"); }
     | FALSE_TOK    { $$ = make_node(AST_BOOLEAN); $$->string_val = strdup("false"); }
     | NULL_TOK     { $$ = make_node(AST_NULL); $$->string_val = strdup("null"); }
     | raw_expr     { $$ = $1; }
-    | object       { $$ = $1; }   /* Missing in your previous code! */
-    | array        { $$ = $1; }   /* Missing in your previous code! */
+    | object       { $$ = $1; }
+    | array        { $$ = $1; }
     ;
 
 /* ------ String with Interpolation ------ */
@@ -510,17 +511,19 @@ json_string:
 
 string_content:
     /* empty */ { $$ = strdup(""); }
-    | string_content STR_CHAR { $$ = concat($1, $2); free($1); }
+    | string_content STR_CHAR {
+        $$ = concat($1, $2);
+        free($1); free($2);
+    }
     | string_content SHELL_SUBST {
         /* Store as $(...) marker so interpolate_string can exec it at eval */
         char *marker = malloc(strlen($2) + 4);
         sprintf(marker, "$(%s)", $2);
         $$ = concat($1, marker);
-        free($1); free(marker);
+        free($1); free($2); free(marker);
     }
     | string_content EXPR_START EXPR_END { $$ = $1; }
     | string_content EXPR_START shell_content_list EXPR_END {
-        // Rebuild the literal string so the evaluator can parse it later
         char* tmp1 = concat($1, "{{");
         char* tmp2 = concat(tmp1, $3);
         $$ = concat(tmp2, "}}");
@@ -530,7 +533,7 @@ string_content:
 
 shell_content_list:
     SHELL_CONTENT { $$ = strdup($1); }
-    | shell_content_list SHELL_CONTENT { $$ = concat($1, $2); }
+    | shell_content_list SHELL_CONTENT { $$ = concat($1, $2); free($1); }
     ;
 
 /* Shell Command Injection */
@@ -557,7 +560,8 @@ object_items:
 
 object_item: json_string COLON value {
     $$ = $3;
-    $$->key = $1->string_val;
+    $$->key = $1->string_val;  /* take ownership of string_val — don't free it */
+    $1->string_val = NULL;     /* prevent double-free when we free the wrapper node */
     free($1);
 }
 | BLOCK_START IF block_expr BLOCK_END object_items BLOCK_START ENDIF BLOCK_END {
@@ -573,14 +577,14 @@ object_item: json_string COLON value {
 }
 | BLOCK_START FOR IDENTIFIER IN IDENTIFIER BLOCK_END object_items BLOCK_START ENDFOR BLOCK_END {
     $$ = make_node(AST_FOR);
-    $$->loop_var = strdup($3);
-    $$->string_val = strdup($5);
+    $$->loop_var = $3;       /* take lexer's strdup directly */
+    $$->string_val = $5;     /* take lexer's strdup directly */
     $$->child = $7;
 }
 | BLOCK_START FOR IDENTIFIER IN ARRAY_LITERAL BLOCK_END object_items BLOCK_START ENDFOR BLOCK_END {
     $$ = make_node(AST_FOR);
-    $$->loop_var = strdup($3);
-    $$->loop_array_literal = strdup($5);
+    $$->loop_var = $3;
+    $$->loop_array_literal = $5;
     $$->string_val = strdup("");
     $$->child = $7;
 };
@@ -655,14 +659,14 @@ array_item:
     }
     | BLOCK_START FOR IDENTIFIER IN IDENTIFIER BLOCK_END array_items BLOCK_START ENDFOR BLOCK_END {
         $$ = make_node(AST_FOR);
-        $$->loop_var = strdup($3);
-        $$->string_val = strdup($5);
+        $$->loop_var = $3;
+        $$->string_val = $5;
         $$->child = $7;
     }
     | BLOCK_START FOR IDENTIFIER IN ARRAY_LITERAL BLOCK_END array_items BLOCK_START ENDFOR BLOCK_END {
         $$ = make_node(AST_FOR);
-        $$->loop_var = strdup($3);
-        $$->loop_array_literal = strdup($5);
+        $$->loop_var = $3;
+        $$->loop_array_literal = $5;
         $$->string_val = strdup("");
         $$->child = $7;
     }
@@ -670,9 +674,9 @@ array_item:
 
 /* ------ Block Expressions ------ */
 block_expr:
-    TRUE_TOK { $$ = strdup("true"); }
+    TRUE_TOK  { $$ = strdup("true"); }
     | FALSE_TOK { $$ = strdup("false"); }
-    | IDENTIFIER { $$ = strdup($1); }
+    | IDENTIFIER { $$ = $1; }  /* take ownership; lexer already strdup'd it */
     ;
 
 
